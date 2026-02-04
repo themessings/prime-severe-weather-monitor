@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Severe Weather Monitor (2x/day, rolling 7-day)
-- US: Official alerts via NWS + snowfall/ice accumulation via NWS gridpoints (best available).
+- US: Official alerts via NWS + snowfall/ice accumulation via NWS gridpoints (preferred).
 - Canada: Forecast-based thresholds via Open-Meteo by default.
-    * Optional: If you provide an Environment Canada feed URL per site (eccc_feed_url),
-      the script will also pull alert headlines from that feed.
+  * Optional: If you provide an Environment Canada ATOM feed URL per site (eccc_feed_url),
+    the script will also pull alert-like headlines from that feed.
 
 Outputs:
 - weather_warning_report.md
@@ -14,19 +14,17 @@ Notifications (optional):
 - Microsoft Teams webhook (TEAMS_WEBHOOK_URL)
 - Email via SMTP (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_TO, EMAIL_FROM)
 
-Run it 2x/day using:
-- cron (Linux) or Task Scheduler (Windows), or GitHub Actions schedule.
+This script is safe to run with NO secrets at all:
+- If TEAMS_WEBHOOK_URL is blank -> no Teams post
+- If SMTP_HOST / EMAIL_TO / EMAIL_FROM are blank -> no email
 """
 
 import csv
 import json
 import os
-import sys
 import time
-import math
-import textwrap
 import datetime as dt
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -37,52 +35,78 @@ from email.mime.multipart import MIMEMultipart
 
 
 # =========================
+# SAFE ENV HELPERS
+# =========================
+
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return (v if v is not None else "").strip()
+
+def env_float(name: str, default: float) -> float:
+    raw = env_str(name, "")
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+def env_int(name: str, default: int) -> int:
+    raw = env_str(name, "")
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+# =========================
 # CONFIG
 # =========================
 
 # Thresholds (7-day totals)
-SNOW_HEADSUP_IN = float(os.getenv("SNOW_HEADSUP_IN", "2.0"))
-SNOW_WARNING_IN = float(os.getenv("SNOW_WARNING_IN", "4.0"))
-SNOW_CRITICAL_IN = float(os.getenv("SNOW_CRITICAL_IN", "8.0"))
+SNOW_HEADSUP_IN = env_float("SNOW_HEADSUP_IN", 2.0)
+SNOW_WARNING_IN = env_float("SNOW_WARNING_IN", 4.0)
+SNOW_CRITICAL_IN = env_float("SNOW_CRITICAL_IN", 8.0)
 
-ICE_HEADSUP_IN = float(os.getenv("ICE_HEADSUP_IN", "0.05"))
-ICE_WARNING_IN = float(os.getenv("ICE_WARNING_IN", "0.10"))
-ICE_CRITICAL_IN = float(os.getenv("ICE_CRITICAL_IN", "0.25"))
+ICE_HEADSUP_IN = env_float("ICE_HEADSUP_IN", 0.05)
+ICE_WARNING_IN = env_float("ICE_WARNING_IN", 0.10)
+ICE_CRITICAL_IN = env_float("ICE_CRITICAL_IN", 0.25)
 
-# Scheduling note: run at 06:00 and 18:00 America/Chicago externally
-LOCAL_TZ_LABEL = os.getenv("LOCAL_TZ_LABEL", "America/Chicago")
+LOCAL_TZ_LABEL = env_str("LOCAL_TZ_LABEL", "America/Chicago")
 
-# NWS requires a real User-Agent identifying your app + contact
-NWS_USER_AGENT = os.getenv(
+# NWS requires a real User-Agent
+NWS_USER_AGENT = env_str(
     "NWS_USER_AGENT",
-    "PrIME-SevereWeatherMonitor/1.0 (contact: your-email@company.com)",
+    "PrIME-SevereWeatherMonitor/1.0 (contact: you@company.com)",
 )
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-RETRY_SLEEP_SEC = float(os.getenv("RETRY_SLEEP_SEC", "1.0"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 20)
+RETRY_SLEEP_SEC = env_float("RETRY_SLEEP_SEC", 1.0)
+MAX_RETRIES = env_int("MAX_RETRIES", 3)
 
 # Optional notifications
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
+TEAMS_WEBHOOK_URL = env_str("TEAMS_WEBHOOK_URL", "")
 
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-EMAIL_TO = os.getenv("EMAIL_TO", "").strip()          # comma-separated
-EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip()
-EMAIL_SUBJECT_PREFIX = os.getenv("EMAIL_SUBJECT_PREFIX", "[Severe Wx] ").strip()
+SMTP_HOST = env_str("SMTP_HOST", "")
+SMTP_PORT = env_int("SMTP_PORT", 587)  # <-- SAFE even if SMTP_PORT is blank/invalid
+SMTP_USER = env_str("SMTP_USER", "")
+SMTP_PASS = env_str("SMTP_PASS", "")
+EMAIL_TO = env_str("EMAIL_TO", "")          # comma-separated
+EMAIL_FROM = env_str("EMAIL_FROM", "")
+EMAIL_SUBJECT_PREFIX = env_str("EMAIL_SUBJECT_PREFIX", "[Severe Wx] ")
 
 # Output files
-OUT_MD = os.getenv("OUT_MD", "weather_warning_report.md")
-OUT_CSV = os.getenv("OUT_CSV", "weather_warning_report.csv")
+OUT_MD = env_str("OUT_MD", "weather_warning_report.md")
+OUT_CSV = env_str("OUT_CSV", "weather_warning_report.csv")
 
 
 # =========================
 # SITES (paste/edit freely)
 # =========================
 # Optional extra column:
-# eccc_feed_url = Environment Canada city/region ATOM feed URL (if you want CA alert headlines)
+# eccc_feed_url = Environment Canada city/region ATOM feed URL (for CA alert-like headlines)
 SITES_CSV = r"""site_name,country,prime_status,lat,lon,site_code,application,bu,address,eccc_feed_url
 Brantford - BRMC,Canada,Active,43.164623,-80.341370,7064,PrIME,NA SMO,"59 Fen Ridge Ct. Brantford ON N3V1G2",
 Greater Chicago Fulfillment Center - GCFC,United States,Active,41.430267,-88.426704,D488,PrIME,NA SMO,"222 Airport Road, Morris, Illinois 60450",
@@ -169,8 +193,6 @@ class SiteResult:
     risk_level: str  # NONE / HEADSUP / WARNING / CRITICAL
     risk_reason: str
     confidence: str  # HIGH / MEDIUM
-
-    # convenience
     address: str = ""
 
 
@@ -214,16 +236,16 @@ def load_sites_from_embedded_csv(csv_text: str) -> List[Site]:
     for row in reader:
         sites.append(
             Site(
-                site_name=row["site_name"].strip(),
-                country=row["country"].strip(),
-                prime_status=row["prime_status"].strip(),
-                lat=float(row["lat"]),
-                lon=float(row["lon"]),
-                site_code=row["site_code"].strip(),
-                application=row.get("application", "").strip(),
-                bu=row.get("bu", "").strip(),
-                address=row.get("address", "").strip(),
-                eccc_feed_url=row.get("eccc_feed_url", "").strip(),
+                site_name=(row.get("site_name") or "").strip(),
+                country=(row.get("country") or "").strip(),
+                prime_status=(row.get("prime_status") or "").strip(),
+                lat=float(row.get("lat") or 0.0),
+                lon=float(row.get("lon") or 0.0),
+                site_code=(row.get("site_code") or "").strip(),
+                application=(row.get("application") or "").strip(),
+                bu=(row.get("bu") or "").strip(),
+                address=(row.get("address") or "").strip(),
+                eccc_feed_url=(row.get("eccc_feed_url") or "").strip(),
             )
         )
     return sites
@@ -234,11 +256,10 @@ def load_sites_from_embedded_csv(csv_text: str) -> List[Site]:
 # =========================
 
 def classify_risk(snow_in: float, ice_in: float, has_alerts: bool) -> Tuple[str, str]:
-    # Alerts always elevate at least to WARNING (you can change this)
+    # Alerts elevate at least to WARNING
     if has_alerts:
         return "WARNING", "Active official alert(s) present"
 
-    # Otherwise threshold-based
     if snow_in >= SNOW_CRITICAL_IN or ice_in >= ICE_CRITICAL_IN:
         return "CRITICAL", "Forecast accumulation exceeds critical threshold"
     if snow_in >= SNOW_WARNING_IN or ice_in >= ICE_WARNING_IN:
@@ -254,12 +275,14 @@ def classify_risk(snow_in: float, ice_in: float, has_alerts: bool) -> Tuple[str,
 # =========================
 
 def fetch_nws_alerts(lat: float, lon: float) -> List[AlertItem]:
-    # NWS Alerts endpoint for a point
     url = f"https://api.weather.gov/alerts/active?point={lat:.6f},{lon:.6f}"
-    data = http_get_json(url, headers={"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"})
+    data = http_get_json(
+        url,
+        headers={"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"},
+    )
     alerts: List[AlertItem] = []
-    for feat in data.get("features", [])[:50]:
-        props = feat.get("properties", {}) or {}
+    for feat in (data.get("features") or [])[:50]:
+        props = feat.get("properties") or {}
         title = props.get("headline") or props.get("event") or "Alert"
         starts = props.get("effective") or props.get("onset")
         ends = props.get("ends") or props.get("expires")
@@ -274,48 +297,40 @@ def fetch_nws_alerts(lat: float, lon: float) -> List[AlertItem]:
 
 def fetch_nws_grid_snow_ice_7d(lat: float, lon: float) -> Tuple[List[float], List[float]]:
     """
-    Returns (daily_snow_in[7], daily_ice_in[7]) using NWS gridpoints if possible.
-
-    Notes:
-    - NWS grid is time-sliced; we aggregate by day (UTC from API). This is "good enough"
-      for planning signals; if you want strict local day boundaries, we can add tz conversion.
+    Returns daily_snow_in[7], daily_ice_in[7] using NWS gridpoints if possible.
+    Aggregation is by UTC day buckets from the API validTime start date.
     """
     headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
 
-    # 1) points -> gridpoints URL
     pt = http_get_json(f"https://api.weather.gov/points/{lat:.6f},{lon:.6f}", headers=headers)
-    props = pt.get("properties", {}) or {}
+    props = pt.get("properties") or {}
     grid_url = props.get("forecastGridData")
     if not grid_url:
         raise RuntimeError("NWS points did not return forecastGridData")
 
     grid = http_get_json(grid_url, headers=headers)
-    gprops = grid.get("properties", {}) or {}
+    gprops = grid.get("properties") or {}
 
-    # NWS units: snowfallAmount is often in "unit:meter" (liquid water equiv?) or "unit:meter" of snow.
-    # Many offices provide snowfallAmount in meters of snow accumulation. iceAccumulation typically meters.
-    # We convert meters -> inches.
     def meters_to_inches(m: float) -> float:
         return m * 39.3700787402
 
-    # Helper: aggregate time series values by date (YYYY-MM-DD from validTime start)
     def aggregate_daily(series: dict) -> List[float]:
-        # series like {"uom": "...", "values": [{"validTime":"2026-02-04T12:00:00+00:00/PT6H","value":0.01}, ...]}
-        vals = series.get("values", []) or []
+        vals = series.get("values") or []
         buckets: Dict[str, float] = {}
         for v in vals:
-            vt = v.get("validTime", "")
+            vt = v.get("validTime") or ""
             value = v.get("value", None)
             if value is None:
                 continue
-            # date key from start time
-            start = vt.split("/")[0]  # "YYYY-MM-DDTHH:MM:SS+00:00"
+            start = vt.split("/")[0]  # "YYYY-MM-DDTHH:MM..."
             day = start[:10]
-            buckets[day] = buckets.get(day, 0.0) + float(value)
-        # next 7 unique days in sorted order
+            try:
+                buckets[day] = buckets.get(day, 0.0) + float(value)
+            except Exception:
+                continue
+
         days_sorted = sorted(buckets.keys())
         out = [buckets[d] for d in days_sorted[:7]]
-        # pad to 7
         while len(out) < 7:
             out.append(0.0)
         return out[:7]
@@ -323,16 +338,8 @@ def fetch_nws_grid_snow_ice_7d(lat: float, lon: float) -> Tuple[List[float], Lis
     snowfall_series = gprops.get("snowfallAmount") or {}
     ice_series = gprops.get("iceAccumulation") or {}
 
-    # If missing, return zeros
-    if not snowfall_series or not snowfall_series.get("values"):
-        daily_snow_m = [0.0] * 7
-    else:
-        daily_snow_m = aggregate_daily(snowfall_series)
-
-    if not ice_series or not ice_series.get("values"):
-        daily_ice_m = [0.0] * 7
-    else:
-        daily_ice_m = aggregate_daily(ice_series)
+    daily_snow_m = aggregate_daily(snowfall_series) if snowfall_series.get("values") else [0.0] * 7
+    daily_ice_m = aggregate_daily(ice_series) if ice_series.get("values") else [0.0] * 7
 
     daily_snow_in = [max(0.0, meters_to_inches(x)) for x in daily_snow_m]
     daily_ice_in = [max(0.0, meters_to_inches(x)) for x in daily_ice_m]
@@ -340,14 +347,11 @@ def fetch_nws_grid_snow_ice_7d(lat: float, lon: float) -> Tuple[List[float], Lis
 
 
 # =========================
-# GLOBAL FALLBACK: OPEN-METEO (snow/ice-ish)
+# GLOBAL FALLBACK: OPEN-METEO
 # =========================
 
 def fetch_open_meteo_snow_7d(lat: float, lon: float) -> List[float]:
-    """
-    Open-Meteo provides daily snowfall_sum in cm (if included).
-    We'll convert cm -> inches.
-    """
+    """Daily snowfall_sum in cm -> inches."""
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat:.6f}&longitude={lon:.6f}"
@@ -356,26 +360,23 @@ def fetch_open_meteo_snow_7d(lat: float, lon: float) -> List[float]:
         "&timezone=UTC"
     )
     data = http_get_json(url, headers={"Accept": "application/json"})
-    daily = data.get("daily", {}) or {}
+    daily = data.get("daily") or {}
     snow_cm = daily.get("snowfall_sum") or [0.0] * 7
-    # cm to inches
-    daily_in = []
+    out: List[float] = []
     for x in snow_cm[:7]:
         try:
-            daily_in.append(max(0.0, float(x) / 2.54))
+            out.append(max(0.0, float(x) / 2.54))
         except Exception:
-            daily_in.append(0.0)
-    while len(daily_in) < 7:
-        daily_in.append(0.0)
-    return daily_in[:7]
+            out.append(0.0)
+    while len(out) < 7:
+        out.append(0.0)
+    return out[:7]
 
 
 def fetch_open_meteo_ice_7d(lat: float, lon: float) -> List[float]:
     """
-    Open-Meteo doesn't provide a perfect "ice accumulation inches" universally.
-    Practical approximation:
-    - Use daily freezing_rain_sum (mm) if available; convert mm -> inches.
-    If not available, return zeros.
+    Approx ice signal via daily freezing_rain_sum (mm) -> inches.
+    If the field isn't available, Open-Meteo returns missing/empty -> we treat as zeros.
     """
     url = (
         "https://api.open-meteo.com/v1/forecast"
@@ -385,17 +386,17 @@ def fetch_open_meteo_ice_7d(lat: float, lon: float) -> List[float]:
         "&timezone=UTC"
     )
     data = http_get_json(url, headers={"Accept": "application/json"})
-    daily = data.get("daily", {}) or {}
+    daily = data.get("daily") or {}
     fr_mm = daily.get("freezing_rain_sum") or [0.0] * 7
-    daily_in = []
+    out: List[float] = []
     for x in fr_mm[:7]:
         try:
-            daily_in.append(max(0.0, float(x) / 25.4))
+            out.append(max(0.0, float(x) / 25.4))
         except Exception:
-            daily_in.append(0.0)
-    while len(daily_in) < 7:
-        daily_in.append(0.0)
-    return daily_in[:7]
+            out.append(0.0)
+    while len(out) < 7:
+        out.append(0.0)
+    return out[:7]
 
 
 # =========================
@@ -403,38 +404,29 @@ def fetch_open_meteo_ice_7d(lat: float, lon: float) -> List[float]:
 # =========================
 
 def fetch_eccc_atom_alert_titles(feed_url: str) -> List[AlertItem]:
-    """
-    Environment Canada forecasts are often published as ATOM feeds per location.
-    If you provide eccc_feed_url in SITES_CSV, we'll parse any entry titles that look like warnings/watches.
-
-    This is intentionally conservative: it won't perfectly catch everything unless your feed is correct.
-    """
     if not feed_url:
         return []
     xml_text = http_get_text(feed_url, headers={"Accept": "application/atom+xml,application/xml,text/xml"})
     root = ET.fromstring(xml_text)
 
-    # ATOM namespace handling
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     alerts: List[AlertItem] = []
 
     for entry in root.findall("atom:entry", ns):
         title_el = entry.find("atom:title", ns)
-        updated_el = entry.find("atom:updated", ns)
         if title_el is None:
             continue
         title = (title_el.text or "").strip()
         if not title:
             continue
 
-        # Heuristic: include if it mentions common warning/watch/advisory terms
         tl = title.lower()
         if any(k in tl for k in ["warning", "watch", "advisory", "statement", "special weather", "blizzard", "winter storm", "ice storm"]):
-            alerts.append(AlertItem(title=title, starts=None, ends=None, severity=None, source="ECCC(ATOM)"))
+            alerts.append(AlertItem(title=title, source="ECCC(ATOM)"))
 
-    # De-dupe
+    # de-dupe
     seen = set()
-    uniq = []
+    uniq: List[AlertItem] = []
     for a in alerts:
         if a.title in seen:
             continue
@@ -460,12 +452,14 @@ def render_markdown(results: List[SiteResult]) -> str:
     warning = [r for r in results if r.risk_level == "WARNING"]
     heads = [r for r in results if r.risk_level == "HEADSUP"]
 
-    def line(r: SiteResult) -> str:
+    def summary_line(r: SiteResult) -> str:
         a = "YES" if r.alerts else "NO"
         return f"- **{r.site_code} — {r.site_name}** ({r.country}) | Alerts: {a} | Snow: {fmt_in(r.snow_7d_in)} in | Ice: {fmt_in(r.ice_7d_in)} in | **{r.risk_level}**"
 
-    md = []
-    md.append(f"# Severe Weather Monitor — 7-Day Rolling Outlook\n\n**Run time:** {now}  \n**Timezone label:** {LOCAL_TZ_LABEL}\n")
+    md: List[str] = []
+    md.append("# Severe Weather Monitor — 7-Day Rolling Outlook\n")
+    md.append(f"**Run time:** {now}  ")
+    md.append(f"**Timezone label:** {LOCAL_TZ_LABEL}\n")
 
     md.append("## Executive Summary\n")
     if not flagged:
@@ -474,17 +468,17 @@ def render_markdown(results: List[SiteResult]) -> str:
         if critical:
             md.append("### Critical (act now)\n")
             for r in sorted(critical, key=lambda x: (-(x.snow_7d_in + x.ice_7d_in), x.site_code)):
-                md.append(line(r))
+                md.append(summary_line(r))
             md.append("")
         if warning:
             md.append("### Warning\n")
             for r in sorted(warning, key=lambda x: (-(x.snow_7d_in + x.ice_7d_in), x.site_code)):
-                md.append(line(r))
+                md.append(summary_line(r))
             md.append("")
         if heads:
             md.append("### Heads-up\n")
             for r in sorted(heads, key=lambda x: (-(x.snow_7d_in + x.ice_7d_in), x.site_code)):
-                md.append(line(r))
+                md.append(summary_line(r))
             md.append("")
 
     md.append("## Site Table (All)\n")
@@ -504,7 +498,9 @@ def render_markdown(results: List[SiteResult]) -> str:
             md.append(f"- **Risk:** {r.risk_level} — {r.risk_reason}")
             md.append(f"- **7-day totals:** Snow {fmt_in(r.snow_7d_in)} in | Ice {fmt_in(r.ice_7d_in)} in")
             md.append(f"- **Confidence:** {r.confidence}")
-            md.append(f"- **Address:** {r.address}")
+            if r.address:
+                md.append(f"- **Address:** {r.address}")
+
             if r.alerts:
                 md.append("\n**Active Alerts:**")
                 for a in r.alerts[:10]:
@@ -516,10 +512,11 @@ def render_markdown(results: List[SiteResult]) -> str:
                     if a.severity:
                         parts.append(f"severity: {a.severity}")
                     parts.append(f"source: {a.source}")
-                    md.append(f"- " + " | ".join(parts))
+                    md.append("- " + " | ".join(parts))
+
             md.append("\n**Daily accumulation (next 7 days, UTC buckets):**")
-            md.append(f"- Snow (in): " + ", ".join(fmt_in(x) for x in r.daily_snow_in))
-            md.append(f"- Ice  (in): " + ", ".join(fmt_in(x) for x in r.daily_ice_in))
+            md.append("- Snow (in): " + ", ".join(fmt_in(x) for x in r.daily_snow_in))
+            md.append("- Ice  (in): " + ", ".join(fmt_in(x) for x in r.daily_ice_in))
             md.append("")
     return "\n".join(md).strip() + "\n"
 
@@ -531,7 +528,7 @@ def write_csv(results: List[SiteResult], path: str) -> None:
         "snow_7d_in", "ice_7d_in",
         "alerts_count", "alerts_titles",
         "daily_snow_in", "daily_ice_in",
-        "address"
+        "address",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -558,20 +555,19 @@ def write_csv(results: List[SiteResult], path: str) -> None:
 
 
 # =========================
-# NOTIFICATIONS
+# NOTIFICATIONS (optional)
 # =========================
 
-def send_teams(webhook_url: str, title: str, markdown_body: str) -> None:
+def send_teams(webhook_url: str, title: str, body: str) -> None:
     if not webhook_url:
         return
-    payload = {
-        "text": f"**{title}**\n\n{markdown_body[:3500]}"  # keep it safe for Teams limits
-    }
+    payload = {"text": f"**{title}**\n\n{body[:3500]}"}
     r = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
 
 
-def send_email(subject: str, body_markdown: str) -> None:
+def send_email(subject: str, body: str) -> None:
+    # Only send if minimally configured
     if not (SMTP_HOST and EMAIL_TO and EMAIL_FROM):
         return
 
@@ -579,15 +575,14 @@ def send_email(subject: str, body_markdown: str) -> None:
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
     msg["Subject"] = subject
-
-    # Plain text (markdown-ish) is fine for internal
-    msg.attach(MIMEText(body_markdown, "plain", "utf-8"))
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=REQUEST_TIMEOUT) as server:
         server.starttls()
         if SMTP_USER and SMTP_PASS:
             server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(EMAIL_FROM, [x.strip() for x in EMAIL_TO.split(",") if x.strip()], msg.as_string())
+        recipients = [x.strip() for x in EMAIL_TO.split(",") if x.strip()]
+        server.sendmail(EMAIL_FROM, recipients, msg.as_string())
 
 
 # =========================
@@ -606,7 +601,7 @@ def evaluate_site(site: Site) -> SiteResult:
         try:
             alerts = fetch_nws_alerts(site.lat, site.lon)
         except Exception as e:
-            # Don't fail whole run on one site
+            # don't fail whole run on one site
             alerts = [AlertItem(title=f"(Alert fetch failed) {e}", source="NWS")]
     elif is_ca and site.eccc_feed_url:
         try:
@@ -619,17 +614,15 @@ def evaluate_site(site: Site) -> SiteResult:
     daily_ice_in = [0.0] * 7
 
     if is_us:
-        # Prefer NWS gridpoints for snow/ice totals
+        # Prefer NWS gridpoints
         try:
             daily_snow_in, daily_ice_in = fetch_nws_grid_snow_ice_7d(site.lat, site.lon)
             confidence = "HIGH"
         except Exception:
-            # fallback
             daily_snow_in = fetch_open_meteo_snow_7d(site.lat, site.lon)
             daily_ice_in = fetch_open_meteo_ice_7d(site.lat, site.lon)
             confidence = "MEDIUM"
     else:
-        # Non-US: Open-Meteo fallback
         daily_snow_in = fetch_open_meteo_snow_7d(site.lat, site.lon)
         daily_ice_in = fetch_open_meteo_ice_7d(site.lat, site.lon)
         confidence = "MEDIUM"
@@ -637,7 +630,10 @@ def evaluate_site(site: Site) -> SiteResult:
     snow_7d = compute_totals(daily_snow_in)
     ice_7d = compute_totals(daily_ice_in)
 
-    risk_level, risk_reason = classify_risk(snow_7d, ice_7d, has_alerts=len(alerts) > 0 and not any("fetch failed" in a.title.lower() for a in alerts))
+    # Determine if alerts are "real" vs a fetch-failed placeholder
+    has_real_alerts = bool(alerts) and not any("fetch failed" in a.title.lower() for a in alerts)
+
+    risk_level, risk_reason = classify_risk(snow_7d, ice_7d, has_alerts=has_real_alerts)
 
     return SiteResult(
         site_code=site.site_code,
@@ -677,8 +673,8 @@ def main() -> int:
                     alerts=[AlertItem(title=f"(Site evaluation failed) {e}", source="SYSTEM")],
                     snow_7d_in=0.0,
                     ice_7d_in=0.0,
-                    daily_snow_in=[0.0]*7,
-                    daily_ice_in=[0.0]*7,
+                    daily_snow_in=[0.0] * 7,
+                    daily_ice_in=[0.0] * 7,
                     risk_level="WARNING",
                     risk_reason="Site evaluation error (treat as warning until resolved)",
                     confidence="MEDIUM",
@@ -686,40 +682,45 @@ def main() -> int:
                 )
             )
 
-    # Write outputs
     md = render_markdown(results)
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write(md)
     write_csv(results, OUT_CSV)
 
-    # Notification summary (keep short)
+    # Short notification body (optional)
     flagged = [r for r in results if r.risk_level != "NONE"]
     critical = [r for r in results if r.risk_level == "CRITICAL"]
     warning = [r for r in results if r.risk_level == "WARNING"]
     heads = [r for r in results if r.risk_level == "HEADSUP"]
 
     subject = f"{EMAIL_SUBJECT_PREFIX}{len(critical)} Critical, {len(warning)} Warning, {len(heads)} Heads-up"
-    top_lines = []
+
+    lines: List[str] = []
     if not flagged:
-        top_lines.append("No sites flagged.")
+        lines.append("No sites flagged.")
     else:
-        for r in sorted(flagged, key=lambda x: ({"CRITICAL":0,"WARNING":1,"HEADSUP":2}.get(x.risk_level,9), -(x.snow_7d_in + x.ice_7d_in)))[:12]:
-            top_lines.append(
+        order = {"CRITICAL": 0, "WARNING": 1, "HEADSUP": 2, "NONE": 9}
+        top = sorted(flagged, key=lambda x: (order.get(x.risk_level, 9), -(x.snow_7d_in + x.ice_7d_in), x.site_code))[:12]
+        for r in top:
+            lines.append(
                 f"- {r.risk_level}: {r.site_code} {r.site_name} | Snow {fmt_in(r.snow_7d_in)} in | Ice {fmt_in(r.ice_7d_in)} in | Alerts {'YES' if r.alerts else 'NO'}"
             )
-    notify_body = "\n".join(top_lines) + "\n\n(Full report written to " + OUT_MD + " and " + OUT_CSV + ".)\n"
+    notify_body = "\n".join(lines) + f"\n\n(Full report written to {OUT_MD} and {OUT_CSV}.)\n"
 
-    # Send notifications (optional)
-    if TEAMS_WEBHOOK_URL:
-        send_teams(TEAMS_WEBHOOK_URL, subject, notify_body)
-    if SMTP_HOST and EMAIL_TO and EMAIL_FROM:
-        send_email(subject, notify_body)
+    # Optional sends
+    try:
+        if TEAMS_WEBHOOK_URL:
+            send_teams(TEAMS_WEBHOOK_URL, subject, notify_body)
+    except Exception as e:
+        print(f"Teams notification failed: {e}")
+
+    try:
+        if SMTP_HOST and EMAIL_TO and EMAIL_FROM:
+            send_email(subject, notify_body)
+    except Exception as e:
+        print(f"Email notification failed: {e}")
 
     print(f"Wrote {OUT_MD} and {OUT_CSV}")
-    if TEAMS_WEBHOOK_URL:
-        print("Teams notification: SENT")
-    if SMTP_HOST and EMAIL_TO and EMAIL_FROM:
-        print("Email notification: SENT")
     return 0
 
 
