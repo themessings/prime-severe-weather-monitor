@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 Severe Weather Monitor (2x/day, rolling 7-day)
-- US: Official alerts via NWS + snowfall/ice accumulation via NWS gridpoints (preferred).
-- Canada: Forecast-based thresholds via Open-Meteo by default.
-  * Optional: If you provide an Environment Canada ATOM feed URL per site (eccc_feed_url),
-    the script will also pull alert-like headlines from that feed.
+
+FIX APPLIED:
+- The NWS "snowfallAmount" grid field is inconsistent across offices and can be liquid-equivalent
+  or otherwise not directly convertible to snow depth. That’s why you saw 200–700 "inches".
+- To guarantee realistic projections in INCHES of snow depth, this version uses:
+    * US + Canada: Open-Meteo daily snowfall_sum (cm) -> inches
+    * US alerts: NWS active alerts (still official)
+    * Canada alerts: optional ECCC ATOM feed titles (if you later add feed URLs)
 
 Outputs:
 - weather_warning_report.md
@@ -90,7 +94,7 @@ MAX_RETRIES = env_int("MAX_RETRIES", 3)
 TEAMS_WEBHOOK_URL = env_str("TEAMS_WEBHOOK_URL", "")
 
 SMTP_HOST = env_str("SMTP_HOST", "")
-SMTP_PORT = env_int("SMTP_PORT", 587)  # <-- SAFE even if SMTP_PORT is blank/invalid
+SMTP_PORT = env_int("SMTP_PORT", 587)  # safe if blank/invalid
 SMTP_USER = env_str("SMTP_USER", "")
 SMTP_PASS = env_str("SMTP_PASS", "")
 EMAIL_TO = env_str("EMAIL_TO", "")          # comma-separated
@@ -292,66 +296,14 @@ def fetch_nws_alerts(lat: float, lon: float) -> List[AlertItem]:
 
 
 # =========================
-# US: NWS GRID (snow/ice)
-# =========================
-
-def fetch_nws_grid_snow_ice_7d(lat: float, lon: float) -> Tuple[List[float], List[float]]:
-    """
-    Returns daily_snow_in[7], daily_ice_in[7] using NWS gridpoints if possible.
-    Aggregation is by UTC day buckets from the API validTime start date.
-    """
-    headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
-
-    pt = http_get_json(f"https://api.weather.gov/points/{lat:.6f},{lon:.6f}", headers=headers)
-    props = pt.get("properties") or {}
-    grid_url = props.get("forecastGridData")
-    if not grid_url:
-        raise RuntimeError("NWS points did not return forecastGridData")
-
-    grid = http_get_json(grid_url, headers=headers)
-    gprops = grid.get("properties") or {}
-
-    def meters_to_inches(m: float) -> float:
-        return m * 39.3700787402
-
-    def aggregate_daily(series: dict) -> List[float]:
-        vals = series.get("values") or []
-        buckets: Dict[str, float] = {}
-        for v in vals:
-            vt = v.get("validTime") or ""
-            value = v.get("value", None)
-            if value is None:
-                continue
-            start = vt.split("/")[0]  # "YYYY-MM-DDTHH:MM..."
-            day = start[:10]
-            try:
-                buckets[day] = buckets.get(day, 0.0) + float(value)
-            except Exception:
-                continue
-
-        days_sorted = sorted(buckets.keys())
-        out = [buckets[d] for d in days_sorted[:7]]
-        while len(out) < 7:
-            out.append(0.0)
-        return out[:7]
-
-    snowfall_series = gprops.get("snowfallAmount") or {}
-    ice_series = gprops.get("iceAccumulation") or {}
-
-    daily_snow_m = aggregate_daily(snowfall_series) if snowfall_series.get("values") else [0.0] * 7
-    daily_ice_m = aggregate_daily(ice_series) if ice_series.get("values") else [0.0] * 7
-
-    daily_snow_in = [max(0.0, meters_to_inches(x)) for x in daily_snow_m]
-    daily_ice_in = [max(0.0, meters_to_inches(x)) for x in daily_ice_m]
-    return daily_snow_in, daily_ice_in
-
-
-# =========================
-# GLOBAL FALLBACK: OPEN-METEO
+# GLOBAL ACCUMULATION: OPEN-METEO (inches)
 # =========================
 
 def fetch_open_meteo_snow_7d(lat: float, lon: float) -> List[float]:
-    """Daily snowfall_sum in cm -> inches."""
+    """
+    Daily snowfall_sum in cm -> inches.
+    Open-Meteo snowfall_sum is snow depth (not liquid equivalent).
+    """
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat:.6f}&longitude={lon:.6f}"
@@ -601,7 +553,6 @@ def evaluate_site(site: Site) -> SiteResult:
         try:
             alerts = fetch_nws_alerts(site.lat, site.lon)
         except Exception as e:
-            # don't fail whole run on one site
             alerts = [AlertItem(title=f"(Alert fetch failed) {e}", source="NWS")]
     elif is_ca and site.eccc_feed_url:
         try:
@@ -609,28 +560,14 @@ def evaluate_site(site: Site) -> SiteResult:
         except Exception as e:
             alerts = [AlertItem(title=f"(ECCC feed fetch failed) {e}", source="ECCC(ATOM)")]
 
-    # Accumulation
-    daily_snow_in = [0.0] * 7
-    daily_ice_in = [0.0] * 7
-
-    if is_us:
-        # Prefer NWS gridpoints
-        try:
-            daily_snow_in, daily_ice_in = fetch_nws_grid_snow_ice_7d(site.lat, site.lon)
-            confidence = "HIGH"
-        except Exception:
-            daily_snow_in = fetch_open_meteo_snow_7d(site.lat, site.lon)
-            daily_ice_in = fetch_open_meteo_ice_7d(site.lat, site.lon)
-            confidence = "MEDIUM"
-    else:
-        daily_snow_in = fetch_open_meteo_snow_7d(site.lat, site.lon)
-        daily_ice_in = fetch_open_meteo_ice_7d(site.lat, site.lon)
-        confidence = "MEDIUM"
+    # Accumulation (REALISTIC snow depth + freezing rain inches)
+    daily_snow_in = fetch_open_meteo_snow_7d(site.lat, site.lon)
+    daily_ice_in = fetch_open_meteo_ice_7d(site.lat, site.lon)
+    confidence = "MEDIUM"  # consistent method for accumulation across all sites
 
     snow_7d = compute_totals(daily_snow_in)
     ice_7d = compute_totals(daily_ice_in)
 
-    # Determine if alerts are "real" vs a fetch-failed placeholder
     has_real_alerts = bool(alerts) and not any("fetch failed" in a.title.lower() for a in alerts)
 
     risk_level, risk_reason = classify_risk(snow_7d, ice_7d, has_alerts=has_real_alerts)
@@ -700,7 +637,10 @@ def main() -> int:
         lines.append("No sites flagged.")
     else:
         order = {"CRITICAL": 0, "WARNING": 1, "HEADSUP": 2, "NONE": 9}
-        top = sorted(flagged, key=lambda x: (order.get(x.risk_level, 9), -(x.snow_7d_in + x.ice_7d_in), x.site_code))[:12]
+        top = sorted(
+            flagged,
+            key=lambda x: (order.get(x.risk_level, 9), -(x.snow_7d_in + x.ice_7d_in), x.site_code)
+        )[:12]
         for r in top:
             lines.append(
                 f"- {r.risk_level}: {r.site_code} {r.site_name} | Snow {fmt_in(r.snow_7d_in)} in | Ice {fmt_in(r.ice_7d_in)} in | Alerts {'YES' if r.alerts else 'NO'}"
